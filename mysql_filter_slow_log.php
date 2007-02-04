@@ -1,6 +1,6 @@
 <?php
 /*
-MySQL Log Filter 1.1
+MySQL Log Filter 1.2
 =====================
 
 Copyright 2007 René Leonhardt
@@ -59,12 +59,12 @@ listed above.
  *
  */
 
-$usage = "MySQL Slow Query Log Filter 1.1 for PHP5 (requires BCMath extension)
+$usage = "MySQL Slow Query Log Filter 1.2 for PHP5 (requires BCMath extension)
 
 Usage:
-
-# Filter slow queries executed from other users than root for at least 3 seconds, remove duplicates and save result to file
-php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates < linux-slow.log > mysql-slow-queries.log
+# Filter slow queries executed for at least 3 seconds not from root,
+# remove duplicates, apply execution count as first ordering and save result to file
+php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates --sort-execution-count < linux-slow.log > mysql-slow-queries.log
 
 # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
 tail -f -n 0 linux-slow.log | php mysql_filter_slow_log.php -T=3 -R=10000 -eu=root -eu=test &
@@ -75,30 +75,42 @@ kill `ps auxww | grep 'tail -f -n 0 linux-slow.log' | egrep -v grep | awk '{prin
 
 
 Options:
--T=min_query_time Include only queries which took at least min_query_time seconds [default: 1]
+-T=min_query_time    Include only queries which took at least min_query_time seconds [default: 1]
 -R=min_rows_examined Include only queries which examined at least min_rows_examined rows
 
--iu=include_user Include only queries which contain include_user in the user field [multiple]
--eu=exclude_user Exclude all queries which contain exclude_user in the user field [multiple]
+-iu=include_user  Include only queries which contain include_user in the user field [multiple]
+-eu=exclude_user  Exclude all queries which contain exclude_user in the user field [multiple]
 -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
 
 --no-duplicates Output only unique query strings with additional statistics:
                 Execution count, Query time: avg / max / sum, Rows examined: avg / max / sum
-                [default sorting: sum_query_time, sum_rows_examined]
+
+Default ordering of unique queries:
+--sort-sum-query-time    [1. position]
+--sort-avg-query-time    [2. position]
+--sort-max-query-time    [3. position]
+--sort-sum-rows-examined [4. position]
+--sort-avg-rows-examined [5. position]
+--sort-max-rows-examined [6. position]
+--sort-execution-count   [7. position]
 
 --help Output this message only and quit
 
-[multiple] options can be passed more than once to set multiple values.";
+[multiple] options can be passed more than once to set multiple values.
+[position] options take the position of their first occurence into account.
+           The first passed option will replace the default first sorting, ...
+           Remaining default ordering options will keep their relative positions.";
 
 function cmp_queries(&$a, &$b) {
-  if($a[1] != $b[1]) return $a[1] < $b[1] ? 1 : -1;
-  return -1 * bccomp($a[2], $b[2]);
+  foreach($GLOBALS['new_sorting'] as $i)
+    if($a[$i] != $b[$i])
+      return 7 == $i ? -1 * bccomp($a[$i], $b[$i]) : ($a[$i] < $b[$i] ? 1 : -1);
+  return 0;
 }
 
 function cmp_query_times(&$a, &$b) {
-  if($a[0] != $b[0]) return $a[0] < $b[0] ? 1 : -1;
-  if($a[1] != $b[1]) return $a[1] < $b[1] ? 1 : -1;
-  if($a[3] != $b[3]) return $a[3] < $b[3] ? 1 : -1;
+  foreach(array(0,1,3) as $i)
+    if($a[$i] != $b[$i]) return $a[$i] < $b[$i] ? 1 : -1;
   return 0;
 }
 
@@ -117,7 +129,8 @@ $exclude_users = array();
 $include_queries = array();
 $no_duplicates = FALSE;
 $ls = defined('PHP_EOL') ? PHP_EOL : "\n";
-
+$default_sorting = array_flip(array(4=>'sum-query-time', 2=>'avg-query-time', 3=>'max-query-time', 7=>'sum-rows-examined', 5=>'avg-rows-examined', 6=>'max-rows-examined', 1=>'execution-count'));
+$new_sorting = array();
 
 foreach($_SERVER['argv'] as $arg) {
   switch(substr($arg, 0, 3)) {
@@ -127,7 +140,11 @@ foreach($_SERVER['argv'] as $arg) {
     case '-eu': $exclude_users[] = substr($arg, 4); break;
     case '-iq': $include_queries[] = substr($arg, 4); break;
     default:
-      switch($arg) {
+      if(substr($arg, 0, 7) == '--sort-') {
+        $sorting = substr($arg, 7);
+        if(isset($default_sorting[$sorting]) && ! in_array($default_sorting[$sorting], $new_sorting))
+          $new_sorting[] = $default_sorting[$sorting];
+      } else switch($arg) {
         case '--no-duplicates': $no_duplicates = TRUE; break;
         case '--help': fwrite(STDERR, $usage); exit(0);
       }
@@ -136,6 +153,9 @@ foreach($_SERVER['argv'] as $arg) {
 }
 $include_users = array_unique($include_users);
 $exclude_users = array_unique($exclude_users);
+foreach($default_sorting as $i)
+  if(! in_array($i, $new_sorting))
+    $new_sorting[] = $i;
 
 
 $in_query = FALSE;
@@ -222,13 +242,15 @@ if($no_duplicates) {
       $output .= implode('', array_keys($query_times));
     }
     $output .= $ls . $query . $ls . $ls;
-    $lines[$query] = array($output, $sum_query_time, $sum_rows_examined, $max_query_time, $max_rows_examined, $execution_count);
+    $avg_query_time = round($sum_query_time / $execution_count, 2);
+    $avg_rows_examined = bcdiv($sum_rows_examined, $execution_count, 0);
+    $lines[$query] = array($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_rows_examined, $max_rows_examined, $sum_rows_examined);
   }
 
   uasort($lines, 'cmp_queries');
   foreach($lines as $query => &$data) {
-    list($output, $sum_query_time, $sum_rows_examined, $max_query_time, $max_rows_examined, $execution_count) = $data;
-    echo "# Execution count: $execution_count. Query time: avg=", number_format(round($sum_query_time / $execution_count, 2), 2, '.', ','), " / max=$max_query_time / sum=$sum_query_time. Rows examined: avg=", number_format(bcdiv($sum_rows_examined, $execution_count, 0), 0, '.', ','), " / max=", number_format($max_rows_examined, 0, '.', ','), " / sum=", number_format($sum_rows_examined, 0, '.', ','), '.', $ls, $output;
+    list($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_rows_examined, $max_rows_examined, $sum_rows_examined) = $data;
+    echo "# Execution count: $execution_count. Query time: avg=", number_format($avg_query_time, 2, '.', ','), " / max=$max_query_time / sum=$sum_query_time. Rows examined: avg=", number_format($avg_rows_examined, 0, '.', ','), " / max=", number_format($max_rows_examined, 0, '.', ','), " / sum=", number_format($sum_rows_examined, 0, '.', ','), '.', $ls, $output;
   }
 }
 

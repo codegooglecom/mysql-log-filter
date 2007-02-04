@@ -2,7 +2,7 @@
 # -*- coding: iso-8859-15 -*-
 
 
-# MySQL Log Filter 1.1
+# MySQL Log Filter 1.2
 # =====================
 #
 # Copyright 2007 René Leonhardt
@@ -53,35 +53,47 @@ Example input lines:
 SELECT * FROM test;
 """
 
-usage = """MySQL Slow Query Log Filter 1.1 for Python 2.5
+usage = """MySQL Slow Query Log Filter 1.2 for Python 2.5
 
 Usage:
-# Filter slow queries executed from other users than root for at least 3 seconds, remove duplicates and save result to file
-python mysql_filter_slow_log.py -T=3 -eu=root --no-duplicates < linux-slow.log > mysql-slow-queries.log
+# Filter slow queries executed for at least 3 seconds not from root,
+# remove duplicates, apply execution count as first ordering and save result to file
+python mysql_filter_slow_log.py -T=3 -eu=root --no-duplicates --sort-execution-count < linux-slow.log > mysql-slow-queries.log
 
 # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
 tail -f -n 0 linux-slow.log | python mysql_filter_slow_log.py -T=3 -R=10000 -eu=root -eu=test &
 # (-n 0 outputs only lines generated after start of tail)
 
 # Stop permanent filtering
-kill `ps auxww | grep 'tail -f -n 0 linux-slow.log' | egrep -v grep | awk '{print 2}'`
+kill `ps auxww | grep 'tail -f -n 0 linux-slow.log' | egrep -v grep | awk '{print $2}'`
 
 
 Options:
--T=min_query_time Include only queries which took at least min_query_time seconds [default: 1]
+-T=min_query_time    Include only queries which took at least min_query_time seconds [default: 1]
 -R=min_rows_examined Include only queries which examined at least min_rows_examined rows
 
--iu=include_user Include only queries which contain include_user in the user field [multiple]
--eu=exclude_user Exclude all queries which contain exclude_user in the user field [multiple]
+-iu=include_user  Include only queries which contain include_user in the user field [multiple]
+-eu=exclude_user  Exclude all queries which contain exclude_user in the user field [multiple]
 -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
 
 --no-duplicates Output only unique query strings with additional statistics:
                 Execution count, Query time: avg / max / sum, Rows examined: avg / max / sum
-                [default sorting: sum_query_time, sum_rows_examined]
+
+Default ordering of unique queries:
+--sort-sum-query-time    [1. position]
+--sort-avg-query-time    [2. position]
+--sort-max-query-time    [3. position]
+--sort-sum-rows-examined [4. position]
+--sort-avg-rows-examined [5. position]
+--sort-max-rows-examined [6. position]
+--sort-execution-count   [7. position]
 
 --help Output this message only and quit
 
 [multiple] options can be passed more than once to set multiple values.
+[position] options take the position of their first occurence into account.
+           The first passed option will replace the default first sorting, ...
+           Remaining default ordering options will keep their relative positions.
 """
 
 import locale
@@ -114,9 +126,9 @@ def cmp_query_times(a, b):
     return 0
 
 def cmp_queries(a, b):
-    """Compare two queries by sum_query_time, sum_rows_examined."""
+    """Compare two queries by the ordering defined in new_sorting."""
 
-    for i in (1,2):
+    for i in new_sorting:
         if a[1][i] != b[1][i]:
             return -1 * cmp(a[1][i], b[1][i])
     return 0
@@ -150,6 +162,8 @@ exclude_users = []
 include_queries = []
 no_duplicates = False
 ls = os.linesep
+default_sorting = ['sum-query-time', 4, 'avg-query-time', 2, 'max-query-time', 3, 'sum-rows-examined', 7, 'avg-rows-examined', 5, 'max-rows-examined', 6, 'execution-count', 1];
+new_sorting = [];
 
 
 # Decode all parameters to Unicode before parsing
@@ -165,11 +179,20 @@ for arg in sys.argv:
     elif '-eu' == _arg: exclude_users.append(arg[4:])
     elif '-iq' == _arg: include_queries.append(arg[4:])
     elif '--no-duplicates' == arg: no_duplicates = True
+    elif '--sort-' == arg[:7]:
+        sorting = arg[7:]
+        if len(sorting) > 1 and sorting in default_sorting:
+            i = default_sorting.index(sorting)+1
+            if sorting not in new_sorting:
+                new_sorting.append(default_sorting[i])
     elif '--help' == arg:
         print >>sys.stderr, usage
         sys.exit()
 include_users = array_unique(include_users)
 exclude_users = array_unique(exclude_users)
+for i in range(1, len(default_sorting), 2):
+    if default_sorting[i] not in new_sorting:
+        new_sorting.append(default_sorting[i])
 
 
 in_query = False
@@ -236,8 +259,8 @@ if no_duplicates:
             query_times = {}
             for query_time in timestamps.itervalues():
                 if not query_times.has_key(query_time):
-                    query_times[query_time] = "# Query_time: %d  Lock_time: %d"\
-                        "  Rows_sent: %d  Rows_examined: %d%s" % (query_time[0],
+                    query_times[query_time] = "# Query_time: %d  Lock_time: "\
+                        "%d  Rows_sent: %d  Rows_examined: %d%s" % (query_time[0],
                         query_time[1], query_time[2], query_time[3], ls)
                     if query_time[0] > max_query_time:
                         max_query_time = query_time[0]
@@ -249,16 +272,18 @@ if no_duplicates:
             for query_time in sorted(query_times.iterkeys(), cmp_query_times):
                 output += query_times[query_time]
         output += "%s%s%s" % (ls, query, ls*2)
-        lines[query] = (output, sum_query_time, sum_rows_examined,
-                        max_query_time, max_rows_examined, execution_count)
+        avg_query_time = float(sum_query_time) / float(execution_count)
+        avg_rows_examined = round(sum_rows_examined / execution_count, 0)
+        lines[query] = (output, execution_count, avg_query_time, max_query_time,
+                        sum_query_time, avg_rows_examined, max_rows_examined,
+                        sum_rows_examined)
 
     for query, data in sorted(lines.iteritems(), cmp_queries):
-        output, sum_query_time, sum_rows_examined, max_query_time, \
-        max_rows_examined, execution_count = data
+        output, execution_count, avg_query_time, max_query_time, sum_query_time,\
+        avg_rows_examined, max_rows_examined, sum_rows_examined = data
         print "# Execution count: %d. Query time: avg=%s / max=%d / sum=%d." % (
-              execution_count, number_format(float(sum_query_time) / float(
-              execution_count), 2), max_query_time, sum_query_time), "Rows", \
+              execution_count, number_format(avg_query_time, 2), max_query_time, sum_query_time), "Rows", \
               "examined: avg=%s / max=%s / sum=%s.%s%s" % (
-              number_format(round(sum_rows_examined / execution_count, 0), 0),
+              number_format(avg_rows_examined, 0),
               number_format(max_rows_examined, 0), number_format(
               sum_rows_examined, 0), ls, output),
