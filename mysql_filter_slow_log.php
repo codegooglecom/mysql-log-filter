@@ -1,6 +1,6 @@
 <?php
 /*
-MySQL Log Filter 1.0
+MySQL Log Filter 1.1
 =====================
 
 Copyright 2007 René Leonhardt
@@ -46,31 +46,8 @@ listed above.
  * log-queries-not-using-indexes
  *
  *
- * Usage:
- *
- * # Filter slow queries executed from other users than root for at least 3 seconds, remove duplicates and save result to file
- * php mysql_filter_slow_log.php -T=3 -eu=root --filter-duplicates < /opt/mysql/data/linux-slow.log > mysql-slow-queries.log
- *
- * # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
- * tail -f -n 0 /opt/mysql/data/linux-slow.log | php mysql_filter_slow_log.php -T=3 -R=10000 -eu=root -eu=test &
- * # (-n 0 outputs only lines generated after start of tail)
- *
- * # Stop permanent filtering
- * kill `ps auxww | grep 'tail -f -n 0 /opt/mysql/data/linux-slow.log' | egrep -v grep | awk '{print $2}'`
- *
- *
- * Options:
- * -T=min_query_time Include only queries which took as long as min_query_time seconds or longer [default: 1]
- * -R=min_rows_examined Include only queries which examined min_rows_examined rows or more
- *
- * -iu=include_user Include only queries which contain include_user in the user field [multiple]
- * -eu=exclude_user Exclude all queries which contain exclude_user in the user field [multiple]
- * -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
- *
- * --filter-duplicates Output only unique query strings with additional statistics: max_query_time, max_rows_examined, sum_query_time, sum_rows_examined, execution count [default sorting: sum_query_time, sum_rows_examined]
- *
- * [multiple] options can be passed more than once to set multiple values.
- *
+ * Required PHP extensions:
+ * - BCMath
  *
  *
  * Example input lines:
@@ -82,14 +59,64 @@ listed above.
  *
  */
 
+$usage = "MySQL Slow Query Log Filter 1.1 for PHP5 (requires BCMath extension)
+
+Usage:
+
+# Filter slow queries executed from other users than root for at least 3 seconds, remove duplicates and save result to file
+php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates < linux-slow.log > mysql-slow-queries.log
+
+# Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
+tail -f -n 0 linux-slow.log | php mysql_filter_slow_log.php -T=3 -R=10000 -eu=root -eu=test &
+# (-n 0 outputs only lines generated after start of tail)
+
+# Stop permanent filtering
+kill `ps auxww | grep 'tail -f -n 0 linux-slow.log' | egrep -v grep | awk '{print $2}'`
+
+
+Options:
+-T=min_query_time Include only queries which took at least min_query_time seconds [default: 1]
+-R=min_rows_examined Include only queries which examined at least min_rows_examined rows
+
+-iu=include_user Include only queries which contain include_user in the user field [multiple]
+-eu=exclude_user Exclude all queries which contain exclude_user in the user field [multiple]
+-iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
+
+--no-duplicates Output only unique query strings with additional statistics:
+                Execution count, Query time: avg / max / sum, Rows examined: avg / max / sum
+                [default sorting: sum_query_time, sum_rows_examined]
+
+--help Output this message only and quit
+
+[multiple] options can be passed more than once to set multiple values.";
+
+function cmp_queries(&$a, &$b) {
+  if($a[1] != $b[1]) return $a[1] < $b[1] ? 1 : -1;
+  return -1 * bccomp($a[2], $b[2]);
+}
+
+function cmp_query_times(&$a, &$b) {
+  if($a[0] != $b[0]) return $a[0] < $b[0] ? 1 : -1;
+  if($a[1] != $b[1]) return $a[1] < $b[1] ? 1 : -1;
+  if($a[3] != $b[3]) return $a[3] < $b[3] ? 1 : -1;
+  return 0;
+}
+
+function process_query(&$queries, $query, $no_duplicates, $user, $timestamp, $query_time, $ls) {
+  if($no_duplicates)
+    $queries[$query][$user][$timestamp] = $query_time;
+  else
+    echo '# Time: ', $timestamp, $ls, "# User@Host: ", $user, $l, "# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]", $ls, $query, $ls;
+}
+
 
 $min_query_time = 1;
 $min_rows_examined = 0;
 $include_users = array();
 $exclude_users = array();
 $include_queries = array();
-$filter_duplicates = FALSE;
-$line_separator = defined('PHP_EOL') ? PHP_EOL : "\n";
+$no_duplicates = FALSE;
+$ls = defined('PHP_EOL') ? PHP_EOL : "\n";
 
 
 foreach($_SERVER['argv'] as $arg) {
@@ -101,7 +128,8 @@ foreach($_SERVER['argv'] as $arg) {
     case '-iq': $include_queries[] = substr($arg, 4); break;
     default:
       switch($arg) {
-        case '--filter-duplicates': $filter_duplicates = TRUE; break;
+        case '--no-duplicates': $no_duplicates = TRUE; break;
+        case '--help': fwrite(STDERR, $usage); exit(0);
       }
       break;
   }
@@ -129,13 +157,8 @@ while($line = stream_get_line(STDIN, 10000, "\n")) {
             break;
           }
       }
-      if($in_query) {
-        if($filter_duplicates) {
-          $queries[$query][$user][$timestamp] = $query_time;
-        } else {
-          echo '# Time: ', $timestamp, "$line_separator# User@Host: ", $user, "$line_separator# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]$line_separator", $query, "$line_separator";
-        }
-      }
+      if($in_query)
+        process_query($queries, $query, $no_duplicates, $user, $timestamp, $query_time, $ls);
       $query = '';
       $in_query = FALSE;
     }
@@ -172,26 +195,22 @@ while($line = stream_get_line(STDIN, 10000, "\n")) {
 
 }
 
-if($query) {
-  if($filter_duplicates) {
-    $queries[$query][$user][$timestamp] = $query_time;
-  } else {
-    echo '# Time: ', $timestamp, "$line_separator# User@Host: ", $user, "$line_separator# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]$line_separator", $query, "$line_separator";
-  }
-}
+if($query)
+  process_query($queries, $query, $no_duplicates, $user, $timestamp, $query_time, $ls);
 
 
-if($filter_duplicates) {
+if($no_duplicates) {
   $lines = array();
   foreach($queries as $query => &$users) {
     $execution_count = 0; $sum_query_time = 0; $sum_rows_examined = '0'; $max_query_time = 0; $max_rows_examined = 0;
     $output = '';
+    ksort($users);
     foreach($users as $user => &$timestamps) {
-      $output .= "# User@Host: ". $user. "$line_separator"; // 'Executed: ' . sizeof($timestamps). " time" . (sizeof($timestamps) > 1 ? 's' : '') .
+      $output .= "# User@Host: ". $user. $ls;
       uasort($timestamps, 'cmp_query_times');
       $query_times = array();
       foreach($timestamps as $query_time) {
-        $query_times["# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]$line_separator"] = 1;
+        $query_times["# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]$ls"] = 1;
         if($query_time[0] > $max_query_time)
           $max_query_time = $query_time[0];
         if($query_time[3] > $max_rows_examined)
@@ -202,29 +221,15 @@ if($filter_duplicates) {
       }
       $output .= implode('', array_keys($query_times));
     }
-    $output .= "$line_separator" . $query . "$line_separator$line_separator";
+    $output .= $ls . $query . $ls . $ls;
     $lines[$query] = array($output, $sum_query_time, $sum_rows_examined, $max_query_time, $max_rows_examined, $execution_count);
   }
 
   uasort($lines, 'cmp_queries');
   foreach($lines as $query => &$data) {
     list($output, $sum_query_time, $sum_rows_examined, $max_query_time, $max_rows_examined, $execution_count) = $data;
-    echo "# Execution count: $execution_count. Query time: avg=", number_format(round($sum_query_time / $execution_count, 2), 2, '.', ','), " / max=$max_query_time / sum=$sum_query_time. Rows examined: avg=", number_format(bcdiv($sum_rows_examined, $execution_count, 0), 0, '.', ','), " / max=", number_format($max_rows_examined, 0, '.', ','), " / sum=", number_format($sum_rows_examined, 0, '.', ','), ". $line_separator", $output;
+    echo "# Execution count: $execution_count. Query time: avg=", number_format(round($sum_query_time / $execution_count, 2), 2, '.', ','), " / max=$max_query_time / sum=$sum_query_time. Rows examined: avg=", number_format(bcdiv($sum_rows_examined, $execution_count, 0), 0, '.', ','), " / max=", number_format($max_rows_examined, 0, '.', ','), " / sum=", number_format($sum_rows_examined, 0, '.', ','), '.', $ls, $output;
   }
-}
-
-
-
-function cmp_queries(&$a, &$b) {
-  if($a[1] != $b[1]) return $a[1] < $b[1] ? 1 : -1;
-  return -1 * bccomp($a[2], $b[2]);
-}
-
-function cmp_query_times(&$a, &$b) {
-  if($a[0] != $b[0]) return $a[0] < $b[0] ? 1 : -1;
-  if($a[1] != $b[1]) return $a[1] < $b[1] ? 1 : -1;
-  if($a[3] != $b[3]) return $a[3] < $b[3] ? 1 : -1;
-  return 0;
 }
 
 ?>
