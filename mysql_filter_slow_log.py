@@ -2,7 +2,7 @@
 # -*- coding: iso-8859-15 -*-
 
 
-# MySQL Log Filter 1.2
+# MySQL Log Filter 1.3
 # =====================
 #
 # Copyright 2007 René Leonhardt
@@ -53,12 +53,12 @@ Example input lines:
 SELECT * FROM test;
 """
 
-usage = """MySQL Slow Query Log Filter 1.2 for Python 2.5
+usage = """MySQL Slow Query Log Filter 1.3 for Python 2.5
 
 Usage:
-# Filter slow queries executed for at least 3 seconds not from root,
-# remove duplicates, apply execution count as first ordering and save result to file
-python mysql_filter_slow_log.py -T=3 -eu=root --no-duplicates --sort-execution-count < linux-slow.log > mysql-slow-queries.log
+# Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
+# apply execution count as first sorting value and save first 10 unique queries to file
+python mysql_filter_slow_log.py -T=3 -eu=root --no-duplicates --sort-execution-count --top=10 < linux-slow.log > mysql-slow-queries.log
 
 # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
 tail -f -n 0 linux-slow.log | python mysql_filter_slow_log.py -T=3 -R=10000 -eu=root -eu=test &
@@ -87,6 +87,8 @@ Default ordering of unique queries:
 --sort-avg-rows-examined [5. position]
 --sort-max-rows-examined [6. position]
 --sort-execution-count   [7. position]
+
+--top=max_unique_qery_count Output maximal max_unique_qery_count different unique qeries
 
 --help Output this message only and quit
 
@@ -164,6 +166,7 @@ no_duplicates = False
 ls = os.linesep
 default_sorting = ['sum-query-time', 4, 'avg-query-time', 2, 'max-query-time', 3, 'sum-rows-examined', 7, 'avg-rows-examined', 5, 'max-rows-examined', 6, 'execution-count', 1];
 new_sorting = [];
+top = 0;
 
 
 # Decode all parameters to Unicode before parsing
@@ -173,21 +176,28 @@ sys.argv = [s.decode(fs_encoding) for s in sys.argv]
 # TODO: use optparse
 for arg in sys.argv:
     _arg = arg[:3]
-    if '-T=' == _arg: min_query_time = int(arg[3:])
-    elif '-R=' == _arg: min_rows_examined = int(arg[3:])
-    elif '-iu' == _arg: include_users.append(arg[4:])
-    elif '-eu' == _arg: exclude_users.append(arg[4:])
-    elif '-iq' == _arg: include_queries.append(arg[4:])
-    elif '--no-duplicates' == arg: no_duplicates = True
-    elif '--sort-' == arg[:7]:
-        sorting = arg[7:]
-        if len(sorting) > 1 and sorting in default_sorting:
-            i = default_sorting.index(sorting)+1
-            if sorting not in new_sorting:
-                new_sorting.append(default_sorting[i])
-    elif '--help' == arg:
-        print >>sys.stderr, usage
-        sys.exit()
+    try:
+        if '-T=' == _arg: min_query_time = abs(int(arg[3:]))
+        elif '-R=' == _arg: min_rows_examined = abs(int(arg[3:]))
+        elif '-iu' == _arg: include_users.append(arg[4:])
+        elif '-eu' == _arg: exclude_users.append(arg[4:])
+        elif '-iq' == _arg: include_queries.append(arg[4:])
+        elif '--no-duplicates' == arg: no_duplicates = True
+        elif '--sort-' == arg[:7]:
+            sorting = arg[7:]
+            if len(sorting) > 1 and sorting in default_sorting:
+                i = default_sorting.index(sorting)+1
+                if sorting not in new_sorting:
+                    new_sorting.append(default_sorting[i])
+        elif '--top=' == arg[:6]:
+            _top = abs(int(arg[6:]))
+            if _top:
+                top = _top;
+        elif '--help' == arg:
+            print >>sys.stderr, usage
+            sys.exit()
+    except ValueError, e:
+        pass
 include_users = array_unique(include_users)
 exclude_users = array_unique(exclude_users)
 for i in range(1, len(default_sorting), 2):
@@ -278,6 +288,7 @@ if no_duplicates:
                         sum_query_time, avg_rows_examined, max_rows_examined,
                         sum_rows_examined)
 
+    i = 0
     for query, data in sorted(lines.iteritems(), cmp_queries):
         output, execution_count, avg_query_time, max_query_time, sum_query_time,\
         avg_rows_examined, max_rows_examined, sum_rows_examined = data
@@ -287,3 +298,6 @@ if no_duplicates:
               number_format(avg_rows_examined, 0),
               number_format(max_rows_examined, 0), number_format(
               sum_rows_examined, 0), ls, output),
+        i += 1
+        if i >= top:
+            break;

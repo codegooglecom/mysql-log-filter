@@ -1,6 +1,6 @@
 <?php
 /*
-MySQL Log Filter 1.2
+MySQL Log Filter 1.3
 =====================
 
 Copyright 2007 René Leonhardt
@@ -59,12 +59,12 @@ listed above.
  *
  */
 
-$usage = "MySQL Slow Query Log Filter 1.2 for PHP5 (requires BCMath extension)
+$usage = "MySQL Slow Query Log Filter 1.3 for PHP5 (requires BCMath extension)
 
 Usage:
-# Filter slow queries executed for at least 3 seconds not from root,
-# remove duplicates, apply execution count as first ordering and save result to file
-php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates --sort-execution-count < linux-slow.log > mysql-slow-queries.log
+# Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
+# apply execution count as first sorting value and save first 10 unique queries to file
+php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates --sort-execution-count --top=10 < linux-slow.log > mysql-slow-queries.log
 
 # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
 tail -f -n 0 linux-slow.log | php mysql_filter_slow_log.php -T=3 -R=10000 -eu=root -eu=test &
@@ -93,6 +93,8 @@ Default ordering of unique queries:
 --sort-avg-rows-examined [5. position]
 --sort-max-rows-examined [6. position]
 --sort-execution-count   [7. position]
+
+--top=max_unique_qery_count Output maximal max_unique_qery_count different unique qeries
 
 --help Output this message only and quit
 
@@ -131,11 +133,12 @@ $no_duplicates = FALSE;
 $ls = defined('PHP_EOL') ? PHP_EOL : "\n";
 $default_sorting = array_flip(array(4=>'sum-query-time', 2=>'avg-query-time', 3=>'max-query-time', 7=>'sum-rows-examined', 5=>'avg-rows-examined', 6=>'max-rows-examined', 1=>'execution-count'));
 $new_sorting = array();
+$top = 0;
 
 foreach($_SERVER['argv'] as $arg) {
   switch(substr($arg, 0, 3)) {
-    case '-T=': $min_query_time = (int) substr($arg, 3); break;
-    case '-R=': $min_rows_examined = (int) substr($arg, 3); break;
+    case '-T=': $min_query_time = abs(substr($arg, 3)); break;
+    case '-R=': $min_rows_examined = abs(substr($arg, 3)); break;
     case '-iu': $include_users[] = substr($arg, 4); break;
     case '-eu': $exclude_users[] = substr($arg, 4); break;
     case '-iq': $include_queries[] = substr($arg, 4); break;
@@ -144,6 +147,10 @@ foreach($_SERVER['argv'] as $arg) {
         $sorting = substr($arg, 7);
         if(isset($default_sorting[$sorting]) && ! in_array($default_sorting[$sorting], $new_sorting))
           $new_sorting[] = $default_sorting[$sorting];
+      } else if(substr($arg, 0, 6) == '--top=') {
+        $_top = abs(substr($arg, 6));
+        if($_top)
+          $top = $_top;
       } else switch($arg) {
         case '--no-duplicates': $no_duplicates = TRUE; break;
         case '--help': fwrite(STDERR, $usage); exit(0);
@@ -248,9 +255,13 @@ if($no_duplicates) {
   }
 
   uasort($lines, 'cmp_queries');
+  $i = 0;
   foreach($lines as $query => &$data) {
     list($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_rows_examined, $max_rows_examined, $sum_rows_examined) = $data;
     echo "# Execution count: $execution_count. Query time: avg=", number_format($avg_query_time, 2, '.', ','), " / max=$max_query_time / sum=$sum_query_time. Rows examined: avg=", number_format($avg_rows_examined, 0, '.', ','), " / max=", number_format($max_rows_examined, 0, '.', ','), " / sum=", number_format($sum_rows_examined, 0, '.', ','), '.', $ls, $output;
+    $i++;
+    if($i >= $top)
+      break;
   }
 }
 
