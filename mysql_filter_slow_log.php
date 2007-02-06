@@ -1,6 +1,6 @@
 <?php
 /*
-MySQL Log Filter 1.3
+MySQL Log Filter 1.4
 =====================
 
 Copyright 2007 René Leonhardt
@@ -59,7 +59,7 @@ listed above.
  *
  */
 
-$usage = "MySQL Slow Query Log Filter 1.3 for PHP5 (requires BCMath extension)
+$usage = "MySQL Slow Query Log Filter 1.4 for PHP5 (requires BCMath extension)
 
 Usage:
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
@@ -83,18 +83,30 @@ Options:
 -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
 
 --no-duplicates Output only unique query strings with additional statistics:
-                Execution count, Query time: avg / max / sum, Rows examined: avg / max / sum
+                Execution count, first and last timestamp.
+                Query time: avg / max / sum.
+                Lock time: avg / max / sum.
+                Rows examined: avg / max / sum.
+                Rows sent: avg / max / sum.
 
 Default ordering of unique queries:
---sort-sum-query-time    [1. position]
---sort-avg-query-time    [2. position]
---sort-max-query-time    [3. position]
---sort-sum-rows-examined [4. position]
---sort-avg-rows-examined [5. position]
---sort-max-rows-examined [6. position]
---sort-execution-count   [7. position]
+--sort-sum-query-time    [ 1. position]
+--sort-avg-query-time    [ 2. position]
+--sort-max-query-time    [ 3. position]
+--sort-sum-lock-time     [ 4. position]
+--sort-avg-lock-time     [ 5. position]
+--sort-max-lock-time     [ 6. position]
+--sort-sum-rows-examined [ 7. position]
+--sort-avg-rows-examined [ 8. position]
+--sort-max-rows-examined [ 9. position]
+--sort-execution-count   [10. position]
+--sort-sum-rows-sent     [11. position]
+--sort-avg-rows-sent     [12. position]
+--sort-max-rows-sent     [13. position]
 
 --top=max_unique_qery_count Output maximal max_unique_qery_count different unique qeries
+--details                   Enables output of timestamp based unique query time lines after user list
+                            (i.e. # Query_time: 81  Lock_time: 0  Rows_sent: 884  Rows_examined: 2448350).
 
 --help Output this message only and quit
 
@@ -106,7 +118,7 @@ Default ordering of unique queries:
 function cmp_queries(&$a, &$b) {
   foreach($GLOBALS['new_sorting'] as $i)
     if($a[$i] != $b[$i])
-      return 7 == $i ? -1 * bccomp($a[$i], $b[$i]) : ($a[$i] < $b[$i] ? 1 : -1);
+      return 10 == $i || 13 == $i ? -1 * bccomp($a[$i], $b[$i]) : ($a[$i] < $b[$i] ? 1 : -1);
   return 0;
 }
 
@@ -130,8 +142,9 @@ $include_users = array();
 $exclude_users = array();
 $include_queries = array();
 $no_duplicates = FALSE;
+$details = FALSE;
 $ls = defined('PHP_EOL') ? PHP_EOL : "\n";
-$default_sorting = array_flip(array(4=>'sum-query-time', 2=>'avg-query-time', 3=>'max-query-time', 7=>'sum-rows-examined', 5=>'avg-rows-examined', 6=>'max-rows-examined', 1=>'execution-count'));
+$default_sorting = array_flip(array(4=>'sum-query-time', 2=>'avg-query-time', 3=>'max-query-time', 7=>'sum-lock-time', 5=>'avg-lock-time', 6=>'max-lock-time', 13=>'sum-rows-examined', 11=>'avg-rows-examined', 12=>'max-rows-examined', 1=>'execution-count', 10=>'sum-rows-sent', 8=>'avg-rows-sent', 9=>'max-rows-sent'));
 $new_sorting = array();
 $top = 0;
 
@@ -153,6 +166,7 @@ foreach($_SERVER['argv'] as $arg) {
           $top = $_top;
       } else switch($arg) {
         case '--no-duplicates': $no_duplicates = TRUE; break;
+        case '--details': $details = TRUE; break;
         case '--help': fwrite(STDERR, $usage); exit(0);
       }
       break;
@@ -173,7 +187,8 @@ $query_time = array();
 $queries = array();
 
 
-while($line = stream_get_line(STDIN, 10000, "\n")) {
+while(! feof(STDIN)) {
+  if(! ($line = stream_get_line(STDIN, 10000, "\n"))) continue;
   if($line[0] == '#' && $line[1] == ' ') {
     if($query) {
       if($include_queries) {
@@ -229,39 +244,96 @@ if($query)
 if($no_duplicates) {
   $lines = array();
   foreach($queries as $query => &$users) {
-    $execution_count = 0; $sum_query_time = 0; $sum_rows_examined = '0'; $max_query_time = 0; $max_rows_examined = 0;
+    $execution_count = $max_timestamp = 0;
+    $min_timestamp = 2147483647;
+    $sum_query_time = $max_query_time = 0;
+    $sum_lock_time = $max_lock_time = 0;
+    $sum_rows_examined = '0'; $max_rows_examined = 0;
+    $sum_rows_sent = '0'; $max_rows_sent = 0;
     $output = '';
     ksort($users);
     foreach($users as $user => &$timestamps) {
       $output .= "# User@Host: ". $user. $ls;
       uasort($timestamps, 'cmp_query_times');
       $query_times = array();
-      foreach($timestamps as $query_time) {
+      foreach($timestamps as $t => $query_time) {
+        // Note: strptime not available on Windows
+        $t = mktime (substr($t,7,2), substr($t,10,2), substr($t,13,2), substr($t,2,2), substr($t,4,2), substr($t,0,2) + 2000);
         $query_times["# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]$ls"] = 1;
         if($query_time[0] > $max_query_time)
           $max_query_time = $query_time[0];
+        if($query_time[1] > $max_lock_time)
+          $max_lock_time = $query_time[1];
+        if($query_time[2] > $max_rows_sent)
+          $max_rows_sent = $query_time[2];
         if($query_time[3] > $max_rows_examined)
           $max_rows_examined = $query_time[3];
+        if($t < $min_timestamp)
+          $min_timestamp = $t;
+        else if($t > $max_timestamp)
+          $max_timestamp = $t;
         $sum_query_time += $query_time[0];
+        $sum_lock_time += $query_time[1];
+        $sum_rows_sent = bcadd($sum_rows_sent, $query_time[2]);
         $sum_rows_examined = bcadd($sum_rows_examined, $query_time[3]);
         $execution_count++;
       }
-      $output .= implode('', array_keys($query_times));
+      if($details)
+        $output .= implode('', array_keys($query_times));
     }
     $output .= $ls . $query . $ls . $ls;
-    $avg_query_time = round($sum_query_time / $execution_count, 2);
-    $avg_rows_examined = bcdiv($sum_rows_examined, $execution_count, 0);
-    $lines[$query] = array($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_rows_examined, $max_rows_examined, $sum_rows_examined);
+    $avg_query_time = round($sum_query_time / $execution_count, 1);
+    $avg_lock_time = round($sum_lock_time / $execution_count, 1);
+    $avg_rows_sent = bcdiv($sum_rows_sent, $execution_count, 1);
+    $avg_rows_examined = bcdiv($sum_rows_examined, $execution_count, 1);
+    $lines[$query] = array($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_lock_time, $max_lock_time, $sum_lock_time, $avg_rows_sent, $max_rows_sent, $sum_rows_sent, $avg_rows_examined, $max_rows_examined, $sum_rows_examined, $min_timestamp, $max_timestamp);
   }
 
   uasort($lines, 'cmp_queries');
   $i = 0;
   foreach($lines as $query => &$data) {
-    list($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_rows_examined, $max_rows_examined, $sum_rows_examined) = $data;
-    echo "# Execution count: $execution_count. Query time: avg=", number_format($avg_query_time, 2, '.', ','), " / max=$max_query_time / sum=$sum_query_time. Rows examined: avg=", number_format($avg_rows_examined, 0, '.', ','), " / max=", number_format($max_rows_examined, 0, '.', ','), " / sum=", number_format($sum_rows_examined, 0, '.', ','), '.', $ls, $output;
-    $i++;
-    if($i >= $top)
-      break;
+    // Determine maximum size for each column
+    $max_length = array(3,3,3);
+    for($k=2; $k < 14; $k++) {
+      $c = $k % 3;
+      $c = $c == 2 ? 0 : $c + 1; // 2 -> 2 -> 0 | 3 -> 0 -> 1 | 4 -> 1 -> 2
+      $data[$k] = number_format($data[$k], $c == 0 ? 1 : 0, '.', ',');
+      if(($l = strlen($data[$k])) > $max_length[$c])
+        $max_length[$c] = $l;
+    }
+
+    // Remove trailing 0 if all average values end with it
+    for($k=1; $k<3; $k++) {
+      foreach(array(2,5,8,11) as $c)
+        if(substr($data[$c], -1) != 0)
+          break 2;
+      foreach(array(2,5,8,11) as $c)
+        $data[$c] = substr($data[$c], 0, -1);
+      $max_length[0]--;
+    }
+
+    list($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_lock_time, $max_lock_time, $sum_lock_time, $avg_rows_sent, $max_rows_sent, $sum_rows_sent, $avg_rows_examined, $max_rows_examined, $sum_rows_examined, $min_timestamp, $max_timestamp) = $data;
+
+    $execution_count = number_format($data[1], 0, '.', ',');
+    echo "# Execution count: $execution_count time", ($data[1] == 1 ? '' : 's') . ' ';
+    if($max_timestamp)
+      echo "between ", date('Y-m-d H:i:s', $min_timestamp), ' and ', date('Y-m-d H:i:s', $max_timestamp);
+    else
+      echo "on ", date('Y-m-d H:i:s', $min_timestamp);
+    echo '.', $ls;
+
+    echo "# Column       : ", str_pad('avg', $max_length[0], ' ', STR_PAD_LEFT), " | ", str_pad('max', $max_length[1], ' ', STR_PAD_LEFT), " | ", str_pad('sum', $max_length[2], ' ', STR_PAD_LEFT), $ls;
+    echo "# Query time   : ", str_pad($avg_query_time, $max_length[0], ' ', STR_PAD_LEFT), " | ", str_pad($max_query_time, $max_length[1], ' ', STR_PAD_LEFT), " | ", str_pad($sum_query_time, $max_length[2], ' ', STR_PAD_LEFT), $ls;
+    echo "# Lock time    : ", str_pad($avg_lock_time, $max_length[0], ' ', STR_PAD_LEFT), " | ", str_pad($max_lock_time, $max_length[1], ' ', STR_PAD_LEFT), " | ", str_pad($sum_lock_time, $max_length[2], ' ', STR_PAD_LEFT), $ls;
+    echo "# Rows examined: ", str_pad($avg_rows_examined, $max_length[0], ' ', STR_PAD_LEFT), " | ", str_pad($max_rows_examined, $max_length[1], ' ', STR_PAD_LEFT), " | ", str_pad($sum_rows_examined, $max_length[2], ' ', STR_PAD_LEFT), $ls;
+    echo "# Rows sent    : ", str_pad($avg_rows_sent, $max_length[0], ' ', STR_PAD_LEFT), " | ", str_pad($max_rows_sent, $max_length[1], ' ', STR_PAD_LEFT), " | ", str_pad($sum_rows_sent, $max_length[2], ' ', STR_PAD_LEFT), $ls;
+    echo $output;
+
+    if($top) {
+      $i++;
+      if($i >= $top)
+        break;
+    }
   }
 }
 
