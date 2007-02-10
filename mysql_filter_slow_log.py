@@ -53,7 +53,7 @@ Example input lines:
 SELECT * FROM test;
 """
 
-usage = """MySQL Slow Query Log Filter 1.4 for Python 2.4
+usage = """MySQL Slow Query Log Filter 1.5 for Python 2.4
 
 Usage:
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
@@ -109,6 +109,9 @@ Default ordering of unique queries:
 --sort-sum-rows-sent     [11. position]
 --sort-avg-rows-sent     [12. position]
 --sort-max-rows-sent     [13. position]
+
+--sort=sum-query-time,avg-query-time,max-query-time,...   You can include multiple sorting values separated by commas.
+--sort=sqt,aqt,mqt,slt,alt,mlt,sre,are,mre,ec,srs,ars,mrs Every long sorting option has an equivalent short form (first character of each word).
 
 --top=max_unique_query_count Output maximal max_unique_query_count different unique queries
 --details                    Enables output of timestamp based unique query time lines after user list
