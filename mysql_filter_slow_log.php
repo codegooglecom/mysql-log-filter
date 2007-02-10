@@ -1,6 +1,6 @@
 <?php
 /*
-MySQL Log Filter 1.4
+MySQL Log Filter 1.5
 =====================
 
 Copyright 2007 René Leonhardt
@@ -59,7 +59,8 @@ listed above.
  *
  */
 
-$usage = "MySQL Slow Query Log Filter 1.4 for PHP5 (requires BCMath extension)
+$usage = <<<EOD
+MySQL Slow Query Log Filter 1.5 for PHP5 (requires BCMath extension)
 
 Usage:
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
@@ -81,6 +82,18 @@ Options:
 -iu=include_user  Include only queries which contain include_user in the user field [multiple]
 -eu=exclude_user  Exclude all queries which contain exclude_user in the user field [multiple]
 -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
+
+--date=[<|>|-]date_first[-][date_last] Include only queries between date_first (and date_last).
+                                       Input:                    Date Range:
+                                       13.11.2006             -> 13.11.2006 - 14.11.2006 (exclusive)
+                                       13.11.2006-15.11.2006  -> 13.11.2006 - 16.11.2006 (exclusive)
+                                       15-11-2006-11/13/2006  -> 13.11.2006 - 16.11.2006 (exclusive)
+                                       >13.11.2006            -> 14.11.2006 - later
+                                       13.11.2006-            -> 13.11.2006 - later
+                                       <13.11.2006            -> earlier    - 13.11.2006 (exclusive)
+                                       -13.11.2006            -> earlier    - 14.11.2006 (exclusive)
+                                       Please do not forget to escape the greater or lesser than symbols (><, i.e. "--date=>13.11.2006").
+                                       Short dates are supported if you include a trailing separator (i.e. 13.11.-11/15/).
 
 --no-duplicates Output only unique query strings with additional statistics:
                 Execution count, first and last timestamp.
@@ -104,16 +117,21 @@ Default ordering of unique queries:
 --sort-avg-rows-sent     [12. position]
 --sort-max-rows-sent     [13. position]
 
---top=max_unique_qery_count Output maximal max_unique_qery_count different unique qeries
---details                   Enables output of timestamp based unique query time lines after user list
-                            (i.e. # Query_time: 81  Lock_time: 0  Rows_sent: 884  Rows_examined: 2448350).
+--sort=sum-query-time,avg-query-time,max-query-time,...   You can include multiple sorting values separated by commas.
+--sort=sqt,aqt,mqt,slt,alt,mlt,sre,are,mre,ec,srs,ars,mrs Every long sorting option has an equivalent short form (first character of each word).
+
+--top=max_unique_query_count Output maximal max_unique_query_count different unique queries
+--details                    Enables output of timestamp based unique query time lines after user list
+                             (i.e. # Query_time: 81  Lock_time: 0  Rows_sent: 884  Rows_examined: 2448350).
 
 --help Output this message only and quit
 
 [multiple] options can be passed more than once to set multiple values.
-[position] options take the position of their first occurence into account.
+[position] options take the position of their first occurrence into account.
            The first passed option will replace the default first sorting, ...
-           Remaining default ordering options will keep their relative positions.";
+           Remaining default ordering options will keep their relative positions.
+EOD;
+
 
 function cmp_queries(&$a, &$b) {
   foreach($GLOBALS['new_sorting'] as $i)
@@ -135,6 +153,83 @@ function process_query(&$queries, $query, $no_duplicates, $user, $timestamp, $qu
     echo '# Time: ', $timestamp, $ls, "# User@Host: ", $user, $l, "# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]", $ls, $query, $ls;
 }
 
+function get_log_timestamp($t) {
+  // Note: strptime not available on Windows
+  return mktime (substr($t,7,2), substr($t,10,2), substr($t,13,2), substr($t,2,2), substr($t,4,2), substr($t,0,2) + 2000);
+}
+
+/**
+ * Input:                    Date Range:
+ * 13.11.2006             -> 13.11.2006 - 14.11.2006 (exclusive)
+ * 13.11.2006-15.11.2006  -> 13.11.2006 - 16.11.2006 (exclusive)
+ * 15-11-2006-11/13/2006  -> 13.11.2006 - 16.11.2006 (exclusive)
+ * >13.11.2006            -> 14.11.2006 - later
+ * 13.11.2006-            -> 13.11.2006 - later
+ * <13.11.2006            -> earlier    - 13.11.2006 (exclusive)
+ * -13.11.2006            -> earlier    - 14.11.2006 (exclusive)
+ */
+function parse_date_range($date) {
+  $date_first = $date_last = FALSE;
+  $_date_first = $_date_last = FALSE;
+
+  $date_regex = '°((?:\d{4}|\d{1,2})(?:[./-]?\d{1,2}[./-]?)(?:\d{4}|\d{1,2})?)(?:-((?:\d{4}|\d{1,2})(?:[./-]?\d{1,2})?(?:[./-]?(?:\d{4}|\d{1,2}))?))?°';
+
+  // Date range: < or > or -
+  if(strpos(' <>-', $date[0])) {
+    if(preg_match($date_regex, $date, $match)
+     && isset($match[1]) && (FALSE !== $time1 = parse_time($match[1]))) {
+       switch($date[0]) {
+         case '>': $_date_first = $time1 + 86400; break;
+         case '-': $_date_last = $time1 + 86400; break;
+         case '<': $_date_last = $time1; break;
+       }
+    }
+  } else {
+    if(! preg_match($date_regex, $date, $match) || ! isset($match[1]))
+      return array($date_first, $date_last);
+
+    $time1 = parse_time($match[1]);
+    if(isset($match[2]) && (FALSE !== $time2 = parse_time($match[2]))) {
+      if(FALSE === $time1) {
+        $_date_last = $time2 + 86400; // -13.11.2006
+      } else {
+        $_date_first = $time1;
+        $_date_last = $time2;
+        if($time2 < $time1)
+          list($_date_first, $_date_last) = array($_date_last, $_date_first);
+        $_date_last += 86400; // 13.11.2006-15.11.2006
+      }
+    } else if(FALSE !== $time1) {
+      // TODO: --date=3.2-
+      if(strlen($date) == strlen($match[1]) || $date[strlen($match[1])] != '-') {
+        $_date_first = $time1;
+        $_date_last = $time1 + 86400; // 13.11.2006
+      } else {
+        $_date_first = $time1; // 13.11.2006-
+      }
+
+    }
+  }
+  return array($_date_first, $_date_last);
+}
+
+/** Return a unix timestamp from the given date. */
+function parse_time($date) {
+  if($date && '-' == $date[strlen($date) -1])
+    $date = substr($date, 0, -1);
+  if(preg_match('°(\d{4}|\d{1,2})([./-])(\d{1,2})(?:\2(\d{4}|\d{1,2}))?°', $date, $match)) {
+    if(! isset($match[4])) $match[4] = '';
+    $formats = array('-' => '%d-%match-%Y', '.' => '%d.%match.%Y', '/' => '%match/%d/%Y');
+    $now = array(idate('Y'));
+    $date = "$match[1]$match[2]$match[3]$match[2]";
+    $date .= substr($now[0], 0, 4-strlen($match[4])) . $match[4];
+
+    return strtotime($date);
+  }
+
+  return FALSE;
+}
+
 
 $min_query_time = 1;
 $min_rows_examined = 0;
@@ -143,8 +238,16 @@ $exclude_users = array();
 $include_queries = array();
 $no_duplicates = FALSE;
 $details = FALSE;
+$date_first = FALSE;
+$date_last = FALSE;
 $ls = defined('PHP_EOL') ? PHP_EOL : "\n";
 $default_sorting = array_flip(array(4=>'sum-query-time', 2=>'avg-query-time', 3=>'max-query-time', 7=>'sum-lock-time', 5=>'avg-lock-time', 6=>'max-lock-time', 13=>'sum-rows-examined', 11=>'avg-rows-examined', 12=>'max-rows-examined', 1=>'execution-count', 10=>'sum-rows-sent', 8=>'avg-rows-sent', 9=>'max-rows-sent'));
+foreach($default_sorting as $k => $v) {
+  $_key = '';
+  foreach(explode('-', $k) as $_word)
+    $_key .= $_word[0];
+  $default_sorting[$_key] = $v;
+}
 $new_sorting = array();
 $top = 0;
 
@@ -156,14 +259,19 @@ foreach($_SERVER['argv'] as $arg) {
     case '-eu': $exclude_users[] = substr($arg, 4); break;
     case '-iq': $include_queries[] = substr($arg, 4); break;
     default:
-      if(substr($arg, 0, 7) == '--sort-') {
-        $sorting = substr($arg, 7);
-        if(isset($default_sorting[$sorting]) && ! in_array($default_sorting[$sorting], $new_sorting))
-          $new_sorting[] = $default_sorting[$sorting];
-      } else if(substr($arg, 0, 6) == '--top=') {
-        $_top = abs(substr($arg, 6));
-        if($_top)
+      if('--sort' == substr($arg, 0, 6) && strlen($arg) > 9 && strpos(' -=', $arg[6])) {
+        foreach(explode(',', substr($arg, 7)) as $sorting) {
+          if(isset($default_sorting[$sorting]) && ! in_array($default_sorting[$sorting], $new_sorting))
+            $new_sorting[] = $default_sorting[$sorting];
+        }
+      } else if('--top=' == substr($arg, 0, 6)) {
+        if($_top = abs(substr($arg, 6)))
           $top = $_top;
+      } else if('--date=' == substr($arg, 0, 7) && strlen($arg) > 10) {
+        // Do not overwrite already parsed date values
+        if($date_first || $date_last)
+          continue;
+        list($date_first, $date_last) = parse_date_range(substr($arg, 7));
       } else switch($arg) {
         case '--no-duplicates': $no_duplicates = TRUE; break;
         case '--details': $details = TRUE; break;
@@ -205,9 +313,12 @@ while(! feof(STDIN)) {
       $in_query = FALSE;
     }
 
-    if($line[2] == 'T')  // # Time: 070119 12:29:58
+    if($line[2] == 'T') { // # Time: 070119 12:29:58
       $timestamp = substr($line, 8);
-    else if($line[2] == 'U') { // # User@Host: root[root] @ localhost []
+      $t = get_log_timestamp($timestamp);
+      if(($date_first && $t < $date_first) || ($date_last && $t > $date_last))
+        $timestamp = FALSE;
+    } else if(($line[2] == 'U') && $timestamp) { // # User@Host: root[root] @ localhost []
       $user = substr($line, 13);
 
       if(! $include_users) {
@@ -225,8 +336,7 @@ while(! feof(STDIN)) {
             break;
           }
       }
-    }
-    else if($in_query && $line[2] == 'Q') { // # Query_time: 0  Lock_time: 0  Rows_sent: 0  Rows_examined: 156
+    } else if($in_query && $line[2] == 'Q') { // # Query_time: 0  Lock_time: 0  Rows_sent: 0  Rows_examined: 156
       $numbers = explode(': ', substr($line, 12));
       $query_time = array((int) $numbers[1], (int) $numbers[2], (int) $numbers[3], (int) $numbers[4]);
       $in_query = $query_time[0] >= $min_query_time || ($min_rows_examined && $query_time[3] >= $min_rows_examined);
@@ -257,8 +367,7 @@ if($no_duplicates) {
       uasort($timestamps, 'cmp_query_times');
       $query_times = array();
       foreach($timestamps as $t => $query_time) {
-        // Note: strptime not available on Windows
-        $t = mktime (substr($t,7,2), substr($t,10,2), substr($t,13,2), substr($t,2,2), substr($t,4,2), substr($t,0,2) + 2000);
+        $t = get_log_timestamp($t);
         $query_times["# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]$ls"] = 1;
         if($query_time[0] > $max_query_time)
           $max_query_time = $query_time[0];
@@ -308,8 +417,9 @@ if($no_duplicates) {
         if(substr($data[$c], -1) != 0)
           break 2;
       foreach(array(2,5,8,11) as $c)
-        $data[$c] = substr($data[$c], 0, -1);
-      $max_length[0]--;
+        $data[$c] = substr($data[$c], 0, -2);
+      if($max_length[0] >= 5)
+        $max_length[0] -= 2;
     }
 
     list($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_lock_time, $max_lock_time, $sum_lock_time, $avg_rows_sent, $max_rows_sent, $sum_rows_sent, $avg_rows_examined, $max_rows_examined, $sum_rows_examined, $min_timestamp, $max_timestamp) = $data;
