@@ -337,7 +337,7 @@ exclude_users = array_unique(exclude_users)
 for i in range(0, len(default_sorting)-1, 2):
     if default_sorting[i] not in new_sorting:
         new_sorting.append(default_sorting[i])
-print new_sorting; sys.exit()
+
 
 in_query = False
 query = ''
