@@ -1,6 +1,6 @@
 <?php
 /*
-MySQL Log Filter 1.5
+MySQL Log Filter 1.8
 =====================
 
 Copyright 2007 René Leonhardt
@@ -60,7 +60,7 @@ listed above.
  */
 
 $usage = <<<EOD
-MySQL Slow Query Log Filter 1.5 for PHP5 (requires BCMath extension)
+MySQL Slow Query Log Filter 1.8 for PHP5 (requires BCMath extension)
 
 Usage:
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
@@ -79,6 +79,8 @@ Options:
 -T=min_query_time    Include only queries which took at least min_query_time seconds [default: 1]
 -R=min_rows_examined Include only queries which examined at least min_rows_examined rows
 
+-ih=include_host  Include only queries which contain include_host in the user field [multiple]
+-eh=exclude_host  Exclude all queries which contain exclude_host in the user field [multiple]
 -iu=include_user  Include only queries which contain include_user in the user field [multiple]
 -eu=exclude_user  Exclude all queries which contain exclude_user in the user field [multiple]
 -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
@@ -146,11 +148,11 @@ function cmp_query_times(&$a, &$b) {
   return 0;
 }
 
-function process_query(&$queries, $query, $no_duplicates, $user, $timestamp, $query_time, $ls) {
+function process_query(&$queries, $query, $no_duplicates, $user, $host, $timestamp, $query_time, $ls) {
   if($no_duplicates)
-    $queries[$query][$user][$timestamp] = $query_time;
+    $queries[$query][$user . ' @ ' . $host][$timestamp] = $query_time;
   else
-    echo '# Time: ', $timestamp, $ls, "# User@Host: ", $user, $l, "# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]", $ls, $query, $ls;
+    echo '# Time: ', $timestamp, $ls, "# User@Host: ", $user, ' @ ', $host, $ls, "# Query_time: $query_time[0]  Lock_time: $query_time[1]  Rows_sent: $query_time[2]  Rows_examined: $query_time[3]", $ls, $query, $ls;
 }
 
 function get_log_timestamp($t) {
@@ -233,6 +235,8 @@ function parse_time($date) {
 
 $min_query_time = 1;
 $min_rows_examined = 0;
+$include_hosts = array();
+$exclude_hosts = array();
 $include_users = array();
 $exclude_users = array();
 $include_queries = array();
@@ -255,6 +259,8 @@ foreach($_SERVER['argv'] as $arg) {
   switch(substr($arg, 0, 3)) {
     case '-T=': $min_query_time = abs(substr($arg, 3)); break;
     case '-R=': $min_rows_examined = abs(substr($arg, 3)); break;
+    case '-ih': $include_hosts[] = substr($arg, 4); break;
+    case '-eh': $exclude_hosts[] = substr($arg, 4); break;
     case '-iu': $include_users[] = substr($arg, 4); break;
     case '-eu': $exclude_users[] = substr($arg, 4); break;
     case '-iq': $include_queries[] = substr($arg, 4); break;
@@ -264,6 +270,16 @@ foreach($_SERVER['argv'] as $arg) {
           if(isset($default_sorting[$sorting]) && ! in_array($default_sorting[$sorting], $new_sorting))
             $new_sorting[] = $default_sorting[$sorting];
         }
+      } else if('--include-user=' == substr($arg, 0, 15)) {
+        $include_users[] = substr($arg, 15); break;
+      } else if('--exclude-user=' == substr($arg, 0, 15)) {
+        $exclude_users[] = substr($arg, 15); break;
+      } else if('--include-host=' == substr($arg, 0, 15)) {
+        $include_hosts[] = substr($arg, 15); break;
+      } else if('--exclude-host=' == substr($arg, 0, 15)) {
+        $exclude_hosts[] = substr($arg, 15); break;
+      } else if('--include-query=' == substr($arg, 0, 16)) {
+        $include_queries[] = substr($arg, 16); break;
       } else if('--top=' == substr($arg, 0, 6)) {
         if($_top = abs(substr($arg, 6)))
           $top = $_top;
@@ -280,6 +296,8 @@ foreach($_SERVER['argv'] as $arg) {
       break;
   }
 }
+$include_hosts = array_unique($include_hosts);
+$exclude_hosts = array_unique($exclude_hosts);
 $include_users = array_unique($include_users);
 $exclude_users = array_unique($exclude_users);
 foreach($default_sorting as $i)
@@ -308,7 +326,7 @@ while(! feof(STDIN)) {
           }
       }
       if($in_query)
-        process_query($queries, $query, $no_duplicates, $user, $timestamp, $query_time, $ls);
+        process_query($queries, $query, $no_duplicates, $user, $host, $timestamp, $query_time, $ls);
       $query = '';
       $in_query = FALSE;
     }
@@ -319,7 +337,25 @@ while(! feof(STDIN)) {
       if(($date_first && $t < $date_first) || ($date_last && $t > $date_last))
         $timestamp = FALSE;
     } else if(($line[2] == 'U') && $timestamp) { // # User@Host: root[root] @ localhost []
-      $user = substr($line, 13);
+      list($user, $host) = explode(' @ ', substr($line, 13), 2);
+
+      if(! $include_hosts) {
+        $in_query = TRUE;
+        foreach($exclude_hosts as $eh)
+          if(FALSE !== stripos($host, $eh)) {
+            $in_query = FALSE;
+            break;
+          }
+      } else {
+        $in_query = FALSE;
+        foreach($include_hosts as $ih)
+          if(FALSE !== stripos($host, $ih)) {
+            $in_query = TRUE;
+            break;
+          }
+      }
+
+      if(! $in_query) continue;
 
       if(! $include_users) {
         $in_query = TRUE;
@@ -348,7 +384,7 @@ while(! feof(STDIN)) {
 }
 
 if($query)
-  process_query($queries, $query, $no_duplicates, $user, $timestamp, $query_time, $ls);
+  process_query($queries, $query, $no_duplicates, $user, $host, $timestamp, $query_time, $ls);
 
 
 if($no_duplicates) {

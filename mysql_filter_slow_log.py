@@ -2,7 +2,7 @@
 # -*- coding: iso-8859-15 -*-
 
 
-# MySQL Log Filter 1.5
+# MySQL Log Filter 1.8
 # =====================
 #
 # Copyright 2007 René Leonhardt
@@ -53,7 +53,7 @@ Example input lines:
 SELECT * FROM test;
 """
 
-usage = """MySQL Slow Query Log Filter 1.5 for Python 2.4
+usage = """MySQL Slow Query Log Filter 1.8 for Python 2.4
 
 Usage:
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
@@ -72,6 +72,8 @@ Options:
 -T=min_query_time    Include only queries which took at least min_query_time seconds [default: 1]
 -R=min_rows_examined Include only queries which examined at least min_rows_examined rows
 
+-ih=include_host  Include only queries which contain include_host in the user field [multiple]
+-eh=exclude_host  Exclude all queries which contain exclude_host in the user field [multiple]
 -iu=include_user  Include only queries which contain include_user in the user field [multiple]
 -eu=exclude_user  Exclude all queries which contain exclude_user in the user field [multiple]
 -iq=include_query Include only queries which contain the string include_query (i.e. database or table name) [multiple]
@@ -171,21 +173,23 @@ def cmp_users(a, b):
 
     return cmp(a[0], b[0])
 
-def process_query(queries, query, no_duplicates, user, timestamp, query_time, ls):
+def process_query(queries, query, no_duplicates, user, host, timestamp,
+                  query_time, ls):
     """Print or save query for later printing."""
 
+    user_host = user + ' @ ' + host
     if no_duplicates:
         if not queries.has_key(query):
             queries[query] = {}
-        if not queries[query].has_key(user):
-            queries[query][user] = {timestamp: query_time}
+        if not queries[query].has_key(user_host):
+            queries[query][user_host] = {timestamp: query_time}
         else:
-            queries[query][user][timestamp] = query_time
+            queries[query][user_host][timestamp] = query_time
     else:
         print '# Time: %s%s# User@Host: %s%s# Query_time: %d  Lock_time: %d  '\
-              'Rows_sent: %d  Rows_examined: %d%s%s%s' % (timestamp, ls, user,
-              ls, query_time[0], query_time[1], query_time[2], query_time[3],
-              ls, query, ls),
+              'Rows_sent: %d  Rows_examined: %d%s%s%s' % (timestamp, ls,
+              user_host, ls, query_time[0], query_time[1], query_time[2],
+              query_time[3], ls, query, ls),
 
 def get_log_timestamp(t):
     return time.mktime(time.strptime(t, '%y%m%d %H:%M:%S'))
@@ -275,6 +279,8 @@ def parse_time(date):
 
 min_query_time = 1
 min_rows_examined = 0
+include_hosts = []
+exclude_hosts = []
 include_users = []
 exclude_users = []
 include_queries = []
@@ -307,6 +313,8 @@ for arg in sys.argv:
     try:
         if '-T=' == _arg: min_query_time = abs(int(arg[3:]))
         elif '-R=' == _arg: min_rows_examined = abs(int(arg[3:]))
+        elif '-ih' == _arg: include_hosts.append(arg[4:])
+        elif '-eh' == _arg: exclude_hosts.append(arg[4:])
         elif '-iu' == _arg: include_users.append(arg[4:])
         elif '-eu' == _arg: exclude_users.append(arg[4:])
         elif '-iq' == _arg: include_queries.append(arg[4:])
@@ -318,6 +326,11 @@ for arg in sys.argv:
                     i = default_sorting.index(sorting)-1
                     if default_sorting[i] not in new_sorting:
                         new_sorting.append(default_sorting[i])
+        elif '--include-user=' == arg[:15]: include_users.append(arg[15:])
+        elif '--exclude-user=' == arg[:15]: exclude_users.append(arg[15:])
+        elif '--include-host=' == arg[:15]: include_hosts.append(arg[15:])
+        elif '--exclude-host=' == arg[:15]: exclude_hosts.append(arg[15:])
+        elif '--include-query=' == arg[:16]: include_queries.append(arg[16:])
         elif '--top=' == arg[:6]:
             _top = abs(int(arg[6:]))
             if _top:
@@ -332,6 +345,8 @@ for arg in sys.argv:
             sys.exit()
     except ValueError, e:
         pass
+include_hosts = array_unique(include_hosts)
+exclude_hosts = array_unique(exclude_hosts)
 include_users = array_unique(include_users)
 exclude_users = array_unique(exclude_users)
 for i in range(0, len(default_sorting)-1, 2):
@@ -357,8 +372,8 @@ for line in sys.stdin:
                         in_query = True
                         break
             if in_query:
-                process_query(queries, query, no_duplicates, user, timestamp,
-                    query_time, ls)
+                process_query(queries, query, no_duplicates, user, host,
+                              timestamp, query_time, ls)
             query = ''
             in_query = False
 
@@ -368,7 +383,22 @@ for line in sys.stdin:
             if date_first and t < date_first or date_last and t > date_last:
                 timestamp = False
         elif line[2] == 'U' and timestamp: # # User@Host: root[root] @ localhost []
-            user = line[13:-1]
+            user, host = line[13:-1].split(' @ ', 2)
+
+            if not include_hosts:
+                in_query = True
+                for eh in exclude_hosts:
+                    if eh in host:
+                        in_query = False
+                        break
+            else:
+                in_query = False
+                for ih in include_hosts:
+                    if ih in host:
+                        in_query = True
+                        break
+
+            if not in_query: continue
 
             if not include_users:
                 in_query = True
@@ -394,7 +424,8 @@ for line in sys.stdin:
         query += line[:-1]
 
 if query:
-    process_query(queries, query, no_duplicates, user, timestamp, query_time, ls)
+    process_query(queries, query, no_duplicates, user, host, timestamp,
+                  query_time, ls)
 
 if no_duplicates:
     lines = {}
