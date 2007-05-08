@@ -1,6 +1,7 @@
 <?php
+
 /*
-MySQL Log Filter 1.8
+MySQL Log Filter 1.9
 =====================
 
 Copyright 2007 René Leonhardt
@@ -36,7 +37,7 @@ listed above.
 
 
 /**
- * Parse the MySQL Slow Query Log from STDIN and write all filtered queries to STDOUT.
+ * Parse the MySQL Slow Query Log from file or STDIN and write all filtered queries or statistics to STDOUT.
  *
  * In order to activate it see http://dev.mysql.com/doc/refman/5.1/en/slow-query-log.html.
  * For example you could add the following lines to your my.ini or my.cnf configuration file under the [mysqld] section:
@@ -48,6 +49,7 @@ listed above.
  *
  * Required PHP extensions:
  * - BCMath
+ * - PDO SQLite (SQLite 3) for --incremental
  *
  *
  * Example input lines:
@@ -60,12 +62,14 @@ listed above.
  */
 
 $usage = <<<EOD
-MySQL Slow Query Log Filter 1.8 for PHP5 (requires BCMath extension)
+MySQL Slow Query Log Filter 1.9 for PHP5 (requires BCMath extension)
 
 Usage:
+
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
-# apply execution count as first sorting value and save first 10 unique queries to file
-php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates --sort-execution-count --top=10 < linux-slow.log > mysql-slow-queries.log
+# apply execution count as first sorting value and save first 10 unique queries to file.
+# An addition, remember last input file position and statistics.
+php mysql_filter_slow_log.php -T=3 -eu=root --no-duplicates --sort-execution-count --top=10 --incremental linux-slow.log > mysql-slow-queries.log
 
 # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
 tail -f -n 0 linux-slow.log | php mysql_filter_slow_log.php -T=3 -R=10000 -eu=root -eu=test &
@@ -76,6 +80,7 @@ kill `ps auxww | grep 'tail -f -n 0 linux-slow.log' | egrep -v grep | awk '{prin
 
 
 Options:
+
 -T=min_query_time    Include only queries which took at least min_query_time seconds [default: 1]
 -R=min_rows_examined Include only queries which examined at least min_rows_examined rows
 
@@ -97,12 +102,16 @@ Options:
                                        Please do not forget to escape the greater or lesser than symbols (><, i.e. "--date=>13.11.2006").
                                        Short dates are supported if you include a trailing separator (i.e. 13.11.-11/15/).
 
+--incremental Remember input file positions and optionally --no-duplicates statistics between executions in mysql_filter_slow_log.sqlite3
+
 --no-duplicates Output only unique query strings with additional statistics:
                 Execution count, first and last timestamp.
                 Query time: avg / max / sum.
                 Lock time: avg / max / sum.
                 Rows examined: avg / max / sum.
                 Rows sent: avg / max / sum.
+
+--no-output Do not print statistics, just update database with incremental statistics
 
 Default ordering of unique queries:
 --sort-sum-query-time    [ 1. position]
@@ -233,6 +242,7 @@ function parse_time($date) {
 }
 
 
+$infile = NULL;
 $min_query_time = 1;
 $min_rows_examined = 0;
 $include_hosts = array();
@@ -241,6 +251,7 @@ $include_users = array();
 $exclude_users = array();
 $include_queries = array();
 $no_duplicates = FALSE;
+$no_output = FALSE;
 $details = FALSE;
 $date_first = FALSE;
 $date_last = FALSE;
@@ -254,7 +265,9 @@ foreach($default_sorting as $k => $v) {
 }
 $new_sorting = array();
 $top = 0;
+$incremental = false;
 
+unset($_SERVER['argv'][0]);
 foreach($_SERVER['argv'] as $arg) {
   switch(substr($arg, 0, 3)) {
     case '-T=': $min_query_time = abs(substr($arg, 3)); break;
@@ -271,15 +284,15 @@ foreach($_SERVER['argv'] as $arg) {
             $new_sorting[] = $default_sorting[$sorting];
         }
       } else if('--include-user=' == substr($arg, 0, 15)) {
-        $include_users[] = substr($arg, 15); break;
+        $include_users[] = substr($arg, 15);
       } else if('--exclude-user=' == substr($arg, 0, 15)) {
-        $exclude_users[] = substr($arg, 15); break;
+        $exclude_users[] = substr($arg, 15);
       } else if('--include-host=' == substr($arg, 0, 15)) {
-        $include_hosts[] = substr($arg, 15); break;
+        $include_hosts[] = substr($arg, 15);
       } else if('--exclude-host=' == substr($arg, 0, 15)) {
-        $exclude_hosts[] = substr($arg, 15); break;
+        $exclude_hosts[] = substr($arg, 15);
       } else if('--include-query=' == substr($arg, 0, 16)) {
-        $include_queries[] = substr($arg, 16); break;
+        $include_queries[] = substr($arg, 16);
       } else if('--top=' == substr($arg, 0, 6)) {
         if($_top = abs(substr($arg, 6)))
           $top = $_top;
@@ -290,12 +303,29 @@ foreach($_SERVER['argv'] as $arg) {
         list($date_first, $date_last) = parse_date_range(substr($arg, 7));
       } else switch($arg) {
         case '--no-duplicates': $no_duplicates = TRUE; break;
+        case '--no-output': $no_output = TRUE; break;
+        case '--incremental': $incremental = TRUE; break;
         case '--details': $details = TRUE; break;
         case '--help': fwrite(STDERR, $usage); exit(0);
+        default:
+          if(!$infile && is_file($arg)) {
+            $infile = fopen($arg, 'r');
+            $infile_name = $arg;
+          }
       }
       break;
   }
 }
+
+if(! $infile) {
+  if(0 !== ftell(STDIN)) {
+    fwrite(STDERR, "ERROR: No input data on STDIN available\n");
+    exit;
+  }
+  $infile = STDIN;
+  $infile_name = '<stdin>';
+}
+
 $include_hosts = array_unique($include_hosts);
 $exclude_hosts = array_unique($exclude_hosts);
 $include_users = array_unique($include_users);
@@ -311,10 +341,30 @@ $timestamp = '';
 $user = '';
 $query_time = array();
 $queries = array();
+$con = NULL;
 
+if($incremental) {
+    if (!extension_loaded('pdo_sqlite')) {
+      fwrite(STDERR, "ERROR: PHP PDO SQLite (SQLite3) extension not available\n");
+      exit;
+    }
+    $con = new PDO("sqlite:mysql_filter_slow_log.sqlite3", "", "", array(PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_NUM));
+    $con->beginTransaction();
+    $con->exec("CREATE TABLE IF NOT EXISTS files (file VARCHAR NOT NULL PRIMARY KEY, last_pos INTEGER NOT NULL DEFAULT 0, last_update INTEGER NOT NULL DEFAULT 0)");
+    $con->exec("CREATE TABLE IF NOT EXISTS hosts (host_id INTEGER PRIMARY KEY, host VARCHAR(255) NOT NULL UNIQUE)");
+    $con->exec("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, user VARCHAR(255) NOT NULL UNIQUE)");
+    $con->exec("CREATE TABLE IF NOT EXISTS queries (query_id INTEGER PRIMARY KEY, query TEXT NOT NULL UNIQUE)");
+    $con->exec("CREATE TABLE IF NOT EXISTS stats (host_id INTEGER UNSIGNED NOT NULL, user_id INTEGER UNSIGNED NOT NULL, query_id INTEGER UNSIGNED NOT NULL, unixdate INTEGER UNSIGNED NOT NULL, query_time INTEGER UNSIGNED NOT NULL, lock_time INTEGER UNSIGNED NOT NULL, rows_sent INTEGER UNSIGNED NOT NULL, rows_examined INTEGER UNSIGNED NOT NULL, PRIMARY KEY(host_id, user_id, query_id, unixdate))");
+    // SELECT host,user,query,COUNT(unixdate) AS execution_count, avg(query_time) AS avg_query_time, max(query_time) AS max_query_time, sum(query_time) AS sum_query_time, avg(lock_time) AS avg_lock_time, max(lock_time) AS max_lock_time, sum(lock_time) AS sum_lock_time, avg(rows_examined) AS avg_rows_examined, max(rows_examined) AS max_rows_examined, sum(rows_examined) AS sum_rows_examined, avg(rows_sent) AS avg_rows_sent, max(rows_sent) AS max_rows_sent, sum(rows_sent) AS sum_rows_sent FROM stats LEFT JOIN hosts USING (host_id) LEFT JOIN users ON (users.user_id=stats.user_id) LEFT JOIN queries ON (queries.query_id=stats.query_id) GROUP BY stats.query_id ORDER BY sum_query_time DESC, avg_query_time DESC, max_query_time DESC, sum_lock_time DESC, avg_lock_time DESC, max_lock_time DESC, sum_rows_examined DESC, avg_rows_examined DESC, max_rows_examined DESC, execution_count DESC, sum_rows_sent DESC, avg_rows_sent DESC, max_rows_sent DESC;
 
-while(! feof(STDIN)) {
-  if(! ($line = stream_get_line(STDIN, 10000, "\n"))) continue;
+    $cur = $con->prepare("SELECT last_pos FROM files WHERE file=?");
+    $cur->execute(array($infile_name));
+    $last_pos = $cur->fetchColumn(0);
+    if($last_pos) fseek($infile, $last_pos); // TODO: infile != stdin, last_pos < size
+}
+
+while(! feof($infile)) {
+  if(! ($line = stream_get_line($infile, 10000, "\n"))) continue;
   if($line[0] == '#' && $line[1] == ' ') {
     if($query) {
       if($include_queries) {
@@ -380,18 +430,52 @@ while(! feof(STDIN)) {
   } else if($in_query) {
     $query .= $line;
   }
-
 }
 
 if($query)
   process_query($queries, $query, $no_duplicates, $user, $host, $timestamp, $query_time, $ls);
 
 
-if($no_duplicates) {
+if($queries && $no_duplicates) {
+  if($con) {
+    $db_queries = array();
+    foreach($con->query("SELECT * FROM queries") as $row)
+      $db_queries[$row[1]] = $row[0];
+    $db_query_id = 1;
+    if($db_queries)
+      $db_query_id = max($db_queries) + 1;
+
+    $db_hosts = array();
+    foreach($con->query("SELECT * FROM hosts") as $row)
+      $db_hosts[$row[1]] = $row[0];
+    $db_host_id = 1;
+    if($db_hosts)
+      $db_host_id = max($db_hosts) + 1;
+
+    $db_users = array();
+    foreach($con->query("SELECT * FROM users") as $row)
+      $db_users[$row[1]] = $row[0];
+    $db_user_id = 1;
+    if($db_users)
+      $db_user_id = max($db_users) + 1;
+  }
+
   $lines = array();
   foreach($queries as $query => &$users) {
+    if($con) {
+      if(isset($db_queries[$query]))
+        $query_id = $db_queries[$query];
+      else {
+        $query_id = $db_query_id;
+        $db_queries[$query] = $query_id;
+        $cur = $con->prepare("INSERT INTO queries VALUES(?,?)");
+        $cur->execute(array($query_id, $query));
+        $db_query_id++;
+      }
+    }
+
     $execution_count = $max_timestamp = 0;
-    $min_timestamp = 2147483647;
+    $min_timestamp = 2147483647; // MAX_INT
     $sum_query_time = $max_query_time = 0;
     $sum_lock_time = $max_lock_time = 0;
     $sum_rows_examined = '0'; $max_rows_examined = 0;
@@ -400,6 +484,28 @@ if($no_duplicates) {
     ksort($users);
     foreach($users as $user => &$timestamps) {
       $output .= "# User@Host: ". $user. $ls;
+      if($con) {
+        list($user, $host) = explode(' @ ', $user, 2);
+        if(isset($db_users[$user]))
+          $user_id = $db_users[$user];
+        else {
+          $user_id = $db_user_id;
+          $db_users[$user] = $user_id;
+          $cur = $con->prepare("INSERT INTO users VALUES(?,?)");
+          $cur->execute(array($user_id, $user));
+          $db_user_id++;
+        }
+        if(isset($db_hosts[$host]))
+          $host_id = $db_hosts[$host];
+        else {
+          $host_id = $db_host_id;
+          $db_hosts[$host] = $host_id;
+          $cur = $con->prepare("INSERT INTO hosts VALUES(?,?)");
+          $cur->execute(array($host_id, $host));
+          $db_host_id++;
+        }
+      }
+
       uasort($timestamps, 'cmp_query_times');
       $query_times = array();
       foreach($timestamps as $t => $query_time) {
@@ -422,6 +528,11 @@ if($no_duplicates) {
         $sum_rows_sent = bcadd($sum_rows_sent, $query_time[2]);
         $sum_rows_examined = bcadd($sum_rows_examined, $query_time[3]);
         $execution_count++;
+
+        if($con) {
+          $cur = $con->prepare("REPLACE INTO stats VALUES(?,?,?,?,?,?,?,?)");
+          $cur->execute(array($host_id, $user_id, $query_id, $t, $query_time[0], $query_time[1], $query_time[2], $query_time[3]));
+        }
       }
       if($details)
         $output .= implode('', array_keys($query_times));
@@ -433,6 +544,9 @@ if($no_duplicates) {
     $avg_rows_examined = bcdiv($sum_rows_examined, $execution_count, 1);
     $lines[$query] = array($output, $execution_count, $avg_query_time, $max_query_time, $sum_query_time, $avg_lock_time, $max_lock_time, $sum_lock_time, $avg_rows_sent, $max_rows_sent, $sum_rows_sent, $avg_rows_examined, $max_rows_examined, $sum_rows_examined, $min_timestamp, $max_timestamp);
   }
+
+  if($no_output)
+    $lines = array(); // Do not output if incremental processing
 
   uasort($lines, 'cmp_queries');
   $i = 0;
@@ -483,4 +597,11 @@ if($no_duplicates) {
   }
 }
 
+
+if($con) {
+  $cur = $con->prepare("REPLACE INTO files VALUES (?,?,strftime('%s','now'))");
+  $cur->execute(array($infile_name, ftell($infile)));
+  $con->commit();
+  unset($con);
+}
 ?>

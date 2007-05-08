@@ -2,7 +2,7 @@
 # -*- coding: iso-8859-15 -*-
 
 
-# MySQL Log Filter 1.8
+# MySQL Log Filter 1.9
 # =====================
 #
 # Copyright 2007 René Leonhardt
@@ -35,7 +35,7 @@
 # listed above.
 
 
-"""Parse the MySQL Slow Query Log from STDIN and write all filtered queries to STDOUT.
+"""Parse the MySQL Slow Query Log from file or STDIN and write all filtered queries or statistics to STDOUT.
 
 In order to activate it see http://dev.mysql.com/doc/refman/5.1/en/slow-query-log.html.
 For example you could add the following lines to your my.ini or my.cnf configuration file under the [mysqld] section:
@@ -43,6 +43,10 @@ For example you could add the following lines to your my.ini or my.cnf configura
 long_query_time=3
 log-slow-queries
 log-queries-not-using-indexes
+
+
+Required Python modules:
+- sqlite3 (included in Python 2.5) or pysqlite2 for --incremental
 
 
 Example input lines:
@@ -53,12 +57,14 @@ Example input lines:
 SELECT * FROM test;
 """
 
-usage = """MySQL Slow Query Log Filter 1.8 for Python 2.4
+usage = """MySQL Slow Query Log Filter 1.9 for Python 2.4
 
 Usage:
+
 # Filter slow queries executed for at least 3 seconds not from root, remove duplicates,
-# apply execution count as first sorting value and save first 10 unique queries to file
-python mysql_filter_slow_log.py -T=3 -eu=root --no-duplicates --sort-execution-count --top=10 < linux-slow.log > mysql-slow-queries.log
+# apply execution count as first sorting value and save first 10 unique queries to file.
+# Remember last input file position and statistics in addition.
+python mysql_filter_slow_log.py -T=3 -eu=root --no-duplicates --sort-execution-count --top=10 --incremental linux-slow.log > mysql-slow-queries.log
 
 # Start permanent filtering of all slow queries from now on: at least 3 seconds or examining 10000 rows, exclude users root and test
 tail -f -n 0 linux-slow.log | python mysql_filter_slow_log.py -T=3 -R=10000 -eu=root -eu=test &
@@ -69,6 +75,7 @@ kill `ps auxww | grep 'tail -f -n 0 linux-slow.log' | egrep -v grep | awk '{prin
 
 
 Options:
+
 -T=min_query_time    Include only queries which took at least min_query_time seconds [default: 1]
 -R=min_rows_examined Include only queries which examined at least min_rows_examined rows
 
@@ -90,12 +97,16 @@ Options:
                                        Please do not forget to escape the greater or lesser than symbols (><, i.e. "--date=>13.11.2006").
                                        Short dates are supported if you include a trailing separator (i.e. 13.11.-11/15/).
 
+--incremental Remember input file positions and optionally --no-duplicates statistics between executions in mysql_filter_slow_log.sqlite3
+
 --no-duplicates Output only unique query strings with additional statistics:
                 Execution count, first and last timestamp.
                 Query time: avg / max / sum.
                 Lock time: avg / max / sum.
                 Rows examined: avg / max / sum.
                 Rows sent: avg / max / sum.
+
+--no-output Do not print statistics, just update database with incremental statistics
 
 Default ordering of unique queries:
 --sort-sum-query-time    [ 1. position]
@@ -277,6 +288,7 @@ def parse_time(date):
     return False
 
 
+infile = None
 min_query_time = 1
 min_rows_examined = 0
 include_hosts = []
@@ -285,6 +297,7 @@ include_users = []
 exclude_users = []
 include_queries = []
 no_duplicates = False
+no_output = False
 details = False
 date_first = False
 date_last = False
@@ -302,13 +315,14 @@ for t in [[default_sorting[i], first_chars(default_sorting[i+1].split('-'))]
   default_sorting.extend(t)
 new_sorting = []
 top = 0
+incremental = False
 
 # Decode all parameters to Unicode before parsing
 fs_encoding = sys.getfilesystemencoding()
 sys.argv = [s.decode(fs_encoding) for s in sys.argv]
 
 # TODO: use optparse
-for arg in sys.argv:
+for arg in sys.argv[1:]:
     _arg = arg[:3]
     try:
         if '-T=' == _arg: min_query_time = abs(int(arg[3:]))
@@ -318,7 +332,9 @@ for arg in sys.argv:
         elif '-iu' == _arg: include_users.append(arg[4:])
         elif '-eu' == _arg: exclude_users.append(arg[4:])
         elif '-iq' == _arg: include_queries.append(arg[4:])
+        elif '--incremental' == arg: incremental = True
         elif '--no-duplicates' == arg: no_duplicates = True
+        elif '--no-output' == arg: no_output = True
         elif '--details' == arg: details = True
         elif '--sort' == arg[:6] and len(arg) > 9 and arg[6] in '=-':
             for sorting in arg[7:].split(','):
@@ -343,8 +359,19 @@ for arg in sys.argv:
         elif '--help' == arg:
             print >>sys.stderr, usage
             sys.exit()
+        elif not infile and os.path.isfile(arg):
+            infile = open(arg, 'r')
     except ValueError, e:
         pass
+
+if not infile:
+    try:
+        sys.stdin.tell()
+        infile = sys.stdin
+    except IOError:
+        print >>sys.stderr, "ERROR: No input data on STDIN available"
+        sys.exit()
+
 include_hosts = array_unique(include_hosts)
 exclude_hosts = array_unique(exclude_hosts)
 include_users = array_unique(include_users)
@@ -360,8 +387,32 @@ timestamp = ''
 user = ''
 query_time = []
 queries = {}
+con = None
 
-for line in sys.stdin:
+if incremental:
+    try:
+        import sqlite3
+    except ImportError, e:
+        try:
+            from pysqlite2 import dbapi2 as sqlite3
+        except ImportError, e:
+            print >>sys.stderr, "ERROR: Python sqlite3 module not available"
+            sys.exit()
+    con = sqlite3.connect("mysql_filter_slow_log.sqlite3")
+    cur = con.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS files (file VARCHAR NOT NULL PRIMARY KEY, last_pos INTEGER NOT NULL DEFAULT 0, last_update INTEGER NOT NULL DEFAULT 0)")
+    cur.execute("CREATE TABLE IF NOT EXISTS hosts (host_id INTEGER PRIMARY KEY, host VARCHAR(255) NOT NULL UNIQUE)")
+    cur.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, user VARCHAR(255) NOT NULL UNIQUE)")
+    cur.execute("CREATE TABLE IF NOT EXISTS queries (query_id INTEGER PRIMARY KEY, query TEXT NOT NULL UNIQUE)")
+    cur.execute("CREATE TABLE IF NOT EXISTS stats (host_id INTEGER UNSIGNED NOT NULL, user_id INTEGER UNSIGNED NOT NULL, query_id INTEGER UNSIGNED NOT NULL, unixdate INTEGER UNSIGNED NOT NULL, query_time INTEGER UNSIGNED NOT NULL, lock_time INTEGER UNSIGNED NOT NULL, rows_sent INTEGER UNSIGNED NOT NULL, rows_examined INTEGER UNSIGNED NOT NULL, PRIMARY KEY(host_id, user_id, query_id, unixdate))")
+    # SELECT host,user,query,COUNT(unixdate) AS execution_count, avg(query_time) AS avg_query_time, max(query_time) AS max_query_time, sum(query_time) AS sum_query_time, avg(lock_time) AS avg_lock_time, max(lock_time) AS max_lock_time, sum(lock_time) AS sum_lock_time, avg(rows_examined) AS avg_rows_examined, max(rows_examined) AS max_rows_examined, sum(rows_examined) AS sum_rows_examined, avg(rows_sent) AS avg_rows_sent, max(rows_sent) AS max_rows_sent, sum(rows_sent) AS sum_rows_sent FROM stats LEFT JOIN hosts USING (host_id) LEFT JOIN users ON (users.user_id=stats.user_id) LEFT JOIN queries ON (queries.query_id=stats.query_id) GROUP BY stats.query_id ORDER BY sum_query_time DESC, avg_query_time DESC, max_query_time DESC, sum_lock_time DESC, avg_lock_time DESC, max_lock_time DESC, sum_rows_examined DESC, avg_rows_examined DESC, max_rows_examined DESC, execution_count DESC, sum_rows_sent DESC, avg_rows_sent DESC, max_rows_sent DESC;
+
+    cur.execute("SELECT last_pos FROM files WHERE file=?", (infile.name,))
+    last_pos = cur.fetchone()
+    last_pos = last_pos and last_pos[0] or 0
+    if last_pos: infile.seek(last_pos) # TODO: infile != stdin, last_pos < size
+
+for line in infile:
     if not line: continue
     if line[0] == '#' and line[1] == ' ':
         if query:
@@ -427,12 +478,43 @@ if query:
     process_query(queries, query, no_duplicates, user, host, timestamp,
                   query_time, ls)
 
-if no_duplicates:
+if queries and no_duplicates:
+    if con:
+        db_queries = {}
+        cur.execute("SELECT * FROM queries")
+        for (id, query) in cur: db_queries[query] = id
+        db_query_id = 1
+        if db_queries:
+            db_query_id = max(db_queries.values()) + 1
+
+        db_hosts = {}
+        cur.execute("SELECT * FROM hosts")
+        for (id, host) in cur: db_hosts[host] = id
+        db_host_id = 1
+        if db_hosts:
+            db_host_id = max(db_hosts.values()) + 1
+
+        db_users = {}
+        cur.execute("SELECT * FROM users")
+        for (id, user) in cur: db_users[user] = id
+        db_user_id = 1
+        if db_users:
+            db_userid = max(db_users.values()) + 1
+
     lines = {}
     for query, users in queries.items():
+        if con:
+            if query in db_queries:
+                query_id = db_queries[query]
+            else:
+                query_id = db_query_id
+                db_queries[query] = query_id
+                cur.execute("INSERT INTO queries VALUES(?,?)", (query_id, query))
+                db_query_id += 1
+
         execution_count = 0
         max_timestamp = 0.0
-        min_timestamp = 2147483647.0
+        min_timestamp = 2147483647.0 # MAX_INT
         sum_query_time = max_query_time = 0
         sum_lock_time = max_lock_time = 0
         sum_rows_examined = max_rows_examined = 0
@@ -440,6 +522,23 @@ if no_duplicates:
         output = ''
         for user, timestamps in sorted(users.iteritems(), cmp_users):
             output += "# User@Host: %s%s" % (user, ls)
+            if con:
+                user, host = user.split(' @ ', 2)
+                if user in db_users:
+                    user_id = db_users[user]
+                else:
+                    user_id = db_user_id
+                    db_users[user] = user_id
+                    cur.execute("INSERT INTO users VALUES(?,?)", (user_id, user))
+                    db_user_id += 1
+                if host in db_hosts:
+                    host_id = db_hosts[host]
+                else:
+                    host_id = db_host_id
+                    db_hosts[host] = host_id
+                    cur.execute("INSERT INTO hosts VALUES(?,?)", (host_id, host))
+                    db_host_id += 1
+
             query_times = {}
             for t, query_time in timestamps.iteritems():
                 t = get_log_timestamp(t)
@@ -464,6 +563,12 @@ if no_duplicates:
                 sum_rows_sent += query_time[2]
                 sum_rows_examined += query_time[3]
                 execution_count += 1
+
+                if con:
+                    cur.execute("REPLACE INTO stats VALUES(?,?,?,?,?,?,?,?)", (
+                        host_id, user_id, query_id, t, query_time[0],
+                        query_time[1], query_time[2], query_time[3]))
+
             if details:
                 for query_time in sorted(query_times.iterkeys(), cmp_query_times):
                     output += query_times[query_time]
@@ -477,6 +582,9 @@ if no_duplicates:
                         sum_lock_time, avg_rows_sent, max_rows_sent,
                         sum_rows_sent, avg_rows_examined, max_rows_examined,
                         sum_rows_examined, min_timestamp, max_timestamp]
+
+    if no_output:
+        lines.clear() # Do not output if incremental processing
 
     i = 0
     for query, data in sorted(lines.iteritems(), cmp_queries):
@@ -525,3 +633,8 @@ if no_duplicates:
             i += 1
             if i >= top:
                 break
+
+if con:
+    cur.execute("REPLACE INTO files VALUES (?,?,strftime('%s','now'))", (infile.name,infile.tell()))
+    con.commit()
+    con.close()
